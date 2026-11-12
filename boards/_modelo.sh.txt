@@ -2,13 +2,16 @@
 # (ou ~/.config/forja/boards/<nome>.sh) e preencha.
 #
 # DESCRIPTION   texto exibido em 'forja boards'
-# FAMILY        gowin | ice40 | ecp5
+# FAMILY        gowin | ice40 | ecp5 | mistral (Cyclone V)
 # DEVICE        gowin: parte completa (ex.: GW2AR-LV18QN88C8/I7)
 #               ice40: hx1k, hx8k, up5k, ...   (vira --<DEVICE> no nextpnr)
 #               ecp5:  25k, 45k, 85k, um5g-25k (vira --<DEVICE> no nextpnr)
+#               mistral: parte completa (ex.: 5CEBA4F23C7)
 # GOWIN_FAMILY  só gowin (ex.: GW2A-18C, GW1N-9C)
 # PACKAGE       só ice40/ecp5 (ex.: sg48, CABGA381)
 # LOADER_BOARD  nome da placa no openFPGALoader (openFPGALoader --list-boards)
+# LOADER_CABLE  alternativa a LOADER_BOARD: só o cabo (openFPGALoader --list-cables)
+# NO_FLASH      (opcional) motivo para recusar 'load -p' nesta placa
 # NEXTPNR_ARGS  (opcional) argumentos extras para o nextpnr
 # ECPPACK_ARGS  (opcional, ecp5) ex.: "--idcode 0x21111043"
 

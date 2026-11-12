@@ -120,16 +120,20 @@ load_board() {
     local f
     f="$(board_file "$BOARD")" || die "Placa desconhecida: $BOARD. Veja 'forja boards'."
     BOARD_FILE="$f"
-    FAMILY=""; DEVICE=""; PACKAGE=""; GOWIN_FAMILY=""; LOADER_BOARD=""
+    FAMILY=""; DEVICE=""; PACKAGE=""; GOWIN_FAMILY=""; LOADER_BOARD=""; LOADER_CABLE=""; NO_FLASH=""
     DESCRIPTION=""; ECPPACK_ARGS=""; NEXTPNR_ARGS=""
     # shellcheck source=/dev/null
     source "$f"
-    [[ -n "$FAMILY" && -n "$LOADER_BOARD" ]] || die "Perfil incompleto: $f (precisa de FAMILY e LOADER_BOARD)"
+    [[ -n "$FAMILY" ]] || die "Perfil incompleto: $f (precisa de FAMILY)"
+    [[ -n "$LOADER_BOARD" || -n "$LOADER_CABLE" ]] || die "Perfil incompleto: $f (precisa de LOADER_BOARD ou LOADER_CABLE)"
+    # Argumentos do openFPGALoader: placa conhecida (-b) ou só o cabo (-c)
+    if [[ -n "$LOADER_BOARD" ]]; then LOADER_ARGS=(-b "$LOADER_BOARD"); else LOADER_ARGS=(-c "$LOADER_CABLE"); fi
     case "$FAMILY" in
-        gowin) CST_EXT=cst; BIT_EXT=fs  ; [[ -n "$DEVICE" && -n "$GOWIN_FAMILY" ]] || die "$f: gowin precisa de DEVICE e GOWIN_FAMILY" ;;
-        ice40) CST_EXT=pcf; BIT_EXT=bin ; [[ -n "$DEVICE" && -n "$PACKAGE" ]]      || die "$f: ice40 precisa de DEVICE e PACKAGE" ;;
-        ecp5)  CST_EXT=lpf; BIT_EXT=bit ; [[ -n "$DEVICE" && -n "$PACKAGE" ]]      || die "$f: ecp5 precisa de DEVICE e PACKAGE" ;;
-        *)     die "$f: família não suportada: $FAMILY (gowin, ice40, ecp5)" ;;
+        gowin)   CST_EXT=cst; BIT_EXT=fs  ; [[ -n "$DEVICE" && -n "$GOWIN_FAMILY" ]]   || die "$f: gowin precisa de DEVICE e GOWIN_FAMILY" ;;
+        ice40)   CST_EXT=pcf; BIT_EXT=bin ; [[ -n "$DEVICE" && -n "$PACKAGE" ]]        || die "$f: ice40 precisa de DEVICE e PACKAGE" ;;
+        ecp5)    CST_EXT=lpf; BIT_EXT=bit ; [[ -n "$DEVICE" && -n "$PACKAGE" ]]        || die "$f: ecp5 precisa de DEVICE e PACKAGE" ;;
+        mistral) CST_EXT=qsf; BIT_EXT=rbf ; [[ -n "$DEVICE" ]]                         || die "$f: mistral precisa de DEVICE" ;;
+        *)       die "$f: família não suportada: $FAMILY (gowin, ice40, ecp5, mistral)" ;;
     esac
     BUILD="$DIR/build/$BOARD"
     BITFILE="$BUILD/$TOP.$BIT_EXT"
@@ -137,11 +141,18 @@ load_board() {
 
 family_tools() {
     case "$1" in
-        gowin) echo "yosys nextpnr-himbaechel gowin_pack" ;;
-        ice40) echo "yosys nextpnr-ice40 icepack" ;;
-        ecp5)  echo "yosys nextpnr-ecp5 ecppack" ;;
+        gowin)   echo "yosys nextpnr-himbaechel gowin_pack" ;;
+        ice40)   echo "yosys nextpnr-ice40 icepack" ;;
+        ecp5)    echo "yosys nextpnr-ecp5 ecppack" ;;
+        mistral) echo "yosys nextpnr-mistral" ;;
     esac
 }
+
+# nextpnr-mistral (Cyclone V) não vem no OSS CAD Suite: é compilado à parte
+for _d in "${NEXTPNR_MISTRAL_DIR:-/nonexistent}" "$HOME/.local/nextpnr-mistral/bin"; do
+    if ! command -v nextpnr-mistral >/dev/null 2>&1 && [[ -x "$_d/nextpnr-mistral" ]]; then PATH="$PATH:$_d"; fi
+done
+unset _d
 
 need() {
     local t missing=()
@@ -181,7 +192,11 @@ find_constraints() {
     for f in "$DIR"/*."$CST_EXT"; do [[ -f "$f" ]] && cands+=("$f"); done
     case ${#cands[@]} in
         1) CST="${cands[0]}" ;;
-        0) die "Nenhum arquivo .$CST_EXT em $DIR. Crie constraints.$CST_EXT (ou $BOARD.$CST_EXT) com a pinagem." ;;
+        0) # sem pinagem no projeto: usa a pinagem padrão da placa, se houver
+           # (boards/<placa>.<ext>, ao lado do perfil)
+           c="${BOARD_FILE%.sh}.$CST_EXT"
+           [[ -f "$c" ]] || die "Nenhum arquivo .$CST_EXT em $DIR e a placa $BOARD não tem pinagem padrão. Crie constraints.$CST_EXT com a pinagem."
+           CST="$c" ;;
         *) die "Vários arquivos .$CST_EXT em $DIR. Renomeie o certo para constraints.$CST_EXT ou $BOARD.$CST_EXT, ou defina CONSTRAINTS= no forja.conf." ;;
     esac
 }
@@ -234,7 +249,11 @@ cmd_synth() {
 
     info "Sintetizando ${C_BLD}$(basename "$DIR")${C_RST} para ${C_BLD}$BOARD${C_RST} (top: $TOP)"
     printf '   %sfontes:%s %s\n' "$C_DIM" "$C_RST" "$(for s in "${SRCS[@]}"; do printf '%s ' "${s#"$DIR"/}"; done)"
-    printf '   %spinos:%s  %s\n' "$C_DIM" "$C_RST" "${CST#"$DIR"/}"
+    if [[ "$CST" == "$DIR"/* ]]; then
+        printf '   %spinos:%s  %s\n' "$C_DIM" "$C_RST" "${CST#"$DIR"/}"
+    else
+        printf '   %spinos:%s  %s %s(padrão da placa)%s\n' "$C_DIM" "$C_RST" "$CST" "$C_DIM" "$C_RST"
+    fi
 
     case "$FAMILY" in
         gowin)
@@ -259,11 +278,17 @@ cmd_synth() {
             # shellcheck disable=SC2086
             step pack    ecppack --compress $ECPPACK_ARGS pnr.config "$BITFILE"
             ;;
+        mistral)
+            step yosys   yosys -p "synth_intel_alm -family cyclonev -top $TOP; write_json synth.json" "${SRCS[@]}"
+            # shellcheck disable=SC2086
+            step nextpnr nextpnr-mistral --device "$DEVICE" --json synth.json --qsf "$CST" \
+                         --rbf "$BITFILE" $NEXTPNR_ARGS
+            ;;
     esac
 
     echo "$hash" > "$BUILD/.hash"
     local fmax
-    fmax="$(grep -oE "Max frequency for clock[^:]*: [0-9.]+ MHz" "$BUILD/nextpnr.log" | tail -n 1 || true)"
+    fmax="$(grep -oE "Max frequency for clock[^:]*: [0-9.]+ MHz" "$BUILD/nextpnr.log" | tail -n 1 | tr -s ' ' || true)"
     [[ -n "$fmax" ]] && printf '   %s%s%s\n' "$C_DIM" "$fmax" "$C_RST"
     ok "Bitstream: ${BITFILE#"$DIR"/}"
 }
@@ -271,14 +296,17 @@ cmd_synth() {
 cmd_load() {
     [[ -n "${BITFILE:-}" ]] || { resolve_project; load_board; }
     need openFPGALoader
-    [[ -f "$BITFILE" ]] || die "Bitstream não encontrado: $BITFILE — rode 'forja synth' ou 'forja run'"
 
-    local args=(-b "$LOADER_BOARD")
+    local args=("${LOADER_ARGS[@]}") file="$BITFILE"
     local where="SRAM (volátil)"
-    if ((PERSIST)); then args+=(--write-flash); where="flash (permanente)"; fi
+    if ((PERSIST)); then
+        [[ -z "$NO_FLASH" ]] || die "Gravação permanente (-p) ainda não é suportada na $BOARD: $NO_FLASH"
+        args+=(--write-flash); where="flash (permanente)"
+    fi
+    [[ -f "$file" ]] || die "Arquivo para gravar não encontrado: $file — rode 'forja synth' ou 'forja run'"
 
-    info "Gravando ${BITFILE#"$DIR"/} na $where da $BOARD"
-    if openFPGALoader "${args[@]}" "$BITFILE"; then
+    info "Gravando ${file#"$DIR"/} na $where da $BOARD"
+    if openFPGALoader "${args[@]}" "$file"; then
         ok "Gravado"
     else
         echo
@@ -351,7 +379,7 @@ cmd_detect() {
         resolve_project
         if [[ -n "$BOARD" ]]; then
             load_board
-            openFPGALoader -b "$LOADER_BOARD" --detect
+            openFPGALoader "${LOADER_ARGS[@]}" --detect
             return
         fi
     fi
@@ -407,14 +435,13 @@ cmd_doctor() {
     for t in yosys openFPGALoader; do check "$t"; done
     echo "${C_BLD}Simulação${C_RST}"
     for t in iverilog vvp gtkwave; do check "$t"; done
-    for fam in gowin ice40 ecp5; do
+    for fam in gowin ice40 ecp5 mistral; do
         echo "${C_BLD}Família $fam${C_RST}"
         for t in $(family_tools "$fam"); do [[ "$t" == yosys ]] || check "$t"; done
     done
     echo
-    if ((all_ok)); then ok "Tudo instalado"; else
-        warn "Faltam ferramentas. No Arch: pacman -S yosys openfpgaloader iverilog gtkwave;"
-        warn "yay -S nextpnr-git prjapicula (gowin), icestorm (ice40), prjtrellis (ecp5)."
+    if ((all_ok)); then ok "Ferramentas open source instaladas"; else
+        warn "Faltam ferramentas. Recomendado: OSS CAD Suite (traz todas), veja o README."
     fi
 }
 
