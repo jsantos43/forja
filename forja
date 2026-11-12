@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────
+#  forja — síntese e gravação de FPGAs com ferramentas open source
+#  yosys → nextpnr → (gowin_pack | icepack | ecppack) → openFPGALoader
+# ─────────────────────────────────────────────────────────────
+set -euo pipefail
+
+FORJA_VERSION="0.1.0"
+FORJA_HOME="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+USER_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/forja"
+
+# ── Saída colorida (só em terminal) ──────────────────────────
+if [[ -t 1 ]]; then
+    C_RED=$'\e[31m'; C_GRN=$'\e[32m'; C_YLW=$'\e[33m'; C_BLU=$'\e[34m'
+    C_DIM=$'\e[2m'; C_BLD=$'\e[1m'; C_RST=$'\e[0m'
+else
+    C_RED=; C_GRN=; C_YLW=; C_BLU=; C_DIM=; C_BLD=; C_RST=
+fi
+
+info() { printf '%s==>%s %s\n' "$C_BLU" "$C_RST" "$*"; }
+ok()   { printf '%s ✓%s  %s\n' "$C_GRN" "$C_RST" "$*"; }
+warn() { printf '%s !%s  %s\n' "$C_YLW" "$C_RST" "$*" >&2; }
+die()  { printf '%s ✗%s  %s\n' "$C_RED" "$C_RST" "$*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+${C_BLD}forja${C_RST} $FORJA_VERSION — síntese e gravação de FPGA (fluxo open source)
+
+${C_BLD}Uso:${C_RST} forja <comando> [pasta] [opções]
+
+${C_BLD}Comandos:${C_RST}
+  synth     Sintetiza e gera o bitstream
+  load      Grava na placa o bitstream já gerado
+  run       Sintetiza (se algo mudou) e grava
+  sim       Simula com iverilog e abre o GTKWave
+  clean     Apaga a pasta build/ do projeto
+  detect    Detecta a placa conectada
+  boards    Lista as placas suportadas
+  init      Cria um forja.conf na pasta do projeto
+  doctor    Verifica se as ferramentas estão instaladas
+
+${C_BLD}Opções:${C_RST}
+  -b, --board <placa>   Placa alvo (ver 'forja boards')
+  -t, --top <módulo>    Módulo top (padrão: top)
+  -p, --persistent      Grava na flash (permanente) em vez da SRAM
+  -f, --force           Ressintetiza mesmo sem mudanças
+  -v, --verbose         Mostra a saída completa das ferramentas
+  -n, --no-wave         (sim) não abre o GTKWave
+  -h, --help            Mostra esta ajuda
+
+A pasta padrão é a atual. A placa é escolhida por: -b, depois forja.conf
+do projeto, depois $USER_CONF_DIR/config.
+EOF
+}
+
+# ── Argumentos ───────────────────────────────────────────────
+CMD="${1:-help}"
+[[ $# -gt 0 ]] && shift
+
+DIR="."
+CLI_BOARD=""; CLI_TOP=""
+PERSIST=0; FORCE=0; VERBOSE=0; NO_WAVE=0
+
+while (($#)); do
+    case "$1" in
+        -b|--board)      [[ $# -ge 2 ]] || die "$1 precisa de um valor"; CLI_BOARD="$2"; shift 2 ;;
+        -t|--top)        [[ $# -ge 2 ]] || die "$1 precisa de um valor"; CLI_TOP="$2"; shift 2 ;;
+        -p|--persistent) PERSIST=1; shift ;;
+        -f|--force)      FORCE=1; shift ;;
+        -v|--verbose)    VERBOSE=1; shift ;;
+        -n|--no-wave)    NO_WAVE=1; shift ;;
+        -h|--help)       usage; exit 0 ;;
+        -*)              die "Opção desconhecida: $1 (veja 'forja --help')" ;;
+        *)               DIR="$1"; shift ;;
+    esac
+done
+
+# ── Configuração (forja.conf: linhas CHAVE=valor) ────────────
+BOARD=""; TOP="top"; CST_OVERRIDE=""
+
+read_conf() {
+    local f="$1" k v
+    [[ -f "$f" ]] || return 0
+    while IFS='=' read -r k v || [[ -n "$k" ]]; do
+        k="${k//[[:space:]]/}"
+        [[ -z "$k" || "$k" == \#* ]] && continue
+        v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+        v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+        case "$k" in
+            BOARD)       BOARD="$v" ;;
+            TOP)         TOP="$v" ;;
+            CONSTRAINTS) CST_OVERRIDE="$v" ;;
+            *)           warn "$f: chave desconhecida '$k' (ignorada)" ;;
+        esac
+    done < "$f"
+}
+
+resolve_project() {
+    [[ -d "$DIR" ]] || die "Pasta não encontrada: $DIR"
+    DIR="$(cd "$DIR" && pwd)"
+    read_conf "$USER_CONF_DIR/config"
+    read_conf "$DIR/forja.conf"
+    [[ -n "$CLI_BOARD" ]] && BOARD="$CLI_BOARD"
+    [[ -n "$CLI_TOP"   ]] && TOP="$CLI_TOP"
+    [[ "$TOP" =~ ^[A-Za-z_][A-Za-z0-9_\$]*$ ]] || die "Nome de módulo top inválido: $TOP"
+}
+
+# ── Placas ───────────────────────────────────────────────────
+board_file() {
+    local name="$1" d
+    for d in "$USER_CONF_DIR/boards" "$FORJA_HOME/boards"; do
+        [[ -f "$d/$name.sh" ]] && { echo "$d/$name.sh"; return 0; }
+    done
+    return 1
+}
+
+load_board() {
+    [[ -n "$BOARD" ]] || die "Nenhuma placa definida. Use -b <placa>, crie um forja.conf ('forja init -b <placa>') ou defina BOARD= em $USER_CONF_DIR/config. Veja 'forja boards'."
+    [[ "$BOARD" =~ ^[A-Za-z0-9_-]+$ ]] || die "Nome de placa inválido: $BOARD"
+    local f
+    f="$(board_file "$BOARD")" || die "Placa desconhecida: $BOARD. Veja 'forja boards'."
+    BOARD_FILE="$f"
+    FAMILY=""; DEVICE=""; PACKAGE=""; GOWIN_FAMILY=""; LOADER_BOARD=""
+    DESCRIPTION=""; ECPPACK_ARGS=""; NEXTPNR_ARGS=""
+    # shellcheck source=/dev/null
+    source "$f"
+    [[ -n "$FAMILY" && -n "$LOADER_BOARD" ]] || die "Perfil incompleto: $f (precisa de FAMILY e LOADER_BOARD)"
+    case "$FAMILY" in
+        gowin) CST_EXT=cst; BIT_EXT=fs  ; [[ -n "$DEVICE" && -n "$GOWIN_FAMILY" ]] || die "$f: gowin precisa de DEVICE e GOWIN_FAMILY" ;;
+        ice40) CST_EXT=pcf; BIT_EXT=bin ; [[ -n "$DEVICE" && -n "$PACKAGE" ]]      || die "$f: ice40 precisa de DEVICE e PACKAGE" ;;
+        ecp5)  CST_EXT=lpf; BIT_EXT=bit ; [[ -n "$DEVICE" && -n "$PACKAGE" ]]      || die "$f: ecp5 precisa de DEVICE e PACKAGE" ;;
+        *)     die "$f: família não suportada: $FAMILY (gowin, ice40, ecp5)" ;;
+    esac
+    BUILD="$DIR/build/$BOARD"
+    BITFILE="$BUILD/$TOP.$BIT_EXT"
+}
+
+family_tools() {
+    case "$1" in
+        gowin) echo "yosys nextpnr-himbaechel gowin_pack" ;;
+        ice40) echo "yosys nextpnr-ice40 icepack" ;;
+        ecp5)  echo "yosys nextpnr-ecp5 ecppack" ;;
+    esac
+}
+
+need() {
+    local t missing=()
+    for t in "$@"; do command -v "$t" >/dev/null 2>&1 || missing+=("$t"); done
+    ((${#missing[@]} == 0)) || die "Ferramenta(s) não encontrada(s): ${missing[*]} — rode 'forja doctor'"
+}
+
+# ── Arquivos do projeto ──────────────────────────────────────
+find_sources() {
+    SRCS=()
+    local d f
+    for d in "$DIR" "$DIR/src"; do
+        [[ -d "$d" ]] || continue
+        while IFS= read -r -d '' f; do SRCS+=("$f"); done < <(
+            find "$d" -maxdepth 1 -type f \( -name '*.v' -o -name '*.sv' \) \
+                 ! -name '*_tb.v' ! -name '*_tb.sv' -print0 | sort -z)
+    done
+    ((${#SRCS[@]} > 0)) || die "Nenhum arquivo .v/.sv encontrado em $DIR (nem em src/)"
+    grep -qE "^[[:space:]]*module[[:space:]]+$TOP\b" "${SRCS[@]}" || {
+        local mods
+        mods="$(grep -hoE '^[[:space:]]*module[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' "${SRCS[@]}" \
+                | awk '{print $2}' | sort -u | tr '\n' ' ')"
+        die "Módulo top '$TOP' não encontrado. Módulos disponíveis: ${mods:-nenhum}. Use -t <módulo>."
+    }
+}
+
+find_constraints() {
+    local c cands=() f
+    if [[ -n "$CST_OVERRIDE" ]]; then
+        [[ "$CST_OVERRIDE" = /* ]] && c="$CST_OVERRIDE" || c="$DIR/$CST_OVERRIDE"
+        [[ -f "$c" ]] || die "Arquivo de constraints do forja.conf não existe: $c"
+        CST="$c"; return
+    fi
+    for c in "$DIR/$BOARD.$CST_EXT" "$DIR/constraints.$CST_EXT"; do
+        [[ -f "$c" ]] && { CST="$c"; return; }
+    done
+    for f in "$DIR"/*."$CST_EXT"; do [[ -f "$f" ]] && cands+=("$f"); done
+    case ${#cands[@]} in
+        1) CST="${cands[0]}" ;;
+        0) die "Nenhum arquivo .$CST_EXT em $DIR. Crie constraints.$CST_EXT (ou $BOARD.$CST_EXT) com a pinagem." ;;
+        *) die "Vários arquivos .$CST_EXT em $DIR. Renomeie o certo para constraints.$CST_EXT ou $BOARD.$CST_EXT, ou defina CONSTRAINTS= no forja.conf." ;;
+    esac
+}
+
+# ── Execução de etapas com log ───────────────────────────────
+step() {
+    local name="$1"; shift
+    local log="$BUILD/$name.log"
+    printf '   %s%-8s%s ' "$C_DIM" "$name" "$C_RST"
+    if ((VERBOSE)); then
+        echo
+        if (cd "$BUILD" && "$@") 2>&1 | tee "$log"; then ok "$name"; return 0; fi
+    else
+        if (cd "$BUILD" && "$@") >"$log" 2>&1; then printf '%s✓%s\n' "$C_GRN" "$C_RST"; return 0; fi
+        printf '%s✗%s\n' "$C_RED" "$C_RST"
+    fi
+    echo
+    local errs
+    errs="$(grep -iE '(^|[^a-z])(error|fatal)' "$log" | head -n 20 || true)"
+    if [[ -n "$errs" ]]; then echo "$errs"; else tail -n 25 "$log"; fi
+    echo
+    die "Falha em '$name'. Log completo: $log"
+}
+
+input_hash() {
+    {
+        echo "board=$BOARD top=$TOP"
+        cat "$BOARD_FILE"
+        sha256sum "${SRCS[@]}" "$CST"
+    } | sha256sum | cut -d' ' -f1
+}
+
+# ── Comandos ─────────────────────────────────────────────────
+cmd_synth() {
+    resolve_project
+    load_board
+    find_sources
+    find_constraints
+    # shellcheck disable=SC2046
+    need $(family_tools "$FAMILY")
+
+    mkdir -p "$BUILD"
+    local hash
+    hash="$(input_hash)"
+    if ((!FORCE)) && [[ -f "$BITFILE" && -f "$BUILD/.hash" && "$(cat "$BUILD/.hash")" == "$hash" ]]; then
+        ok "Nada mudou — bitstream atual: ${BITFILE#"$DIR"/}"
+        return 0
+    fi
+    rm -f "$BUILD/.hash" "$BITFILE"
+
+    info "Sintetizando ${C_BLD}$(basename "$DIR")${C_RST} para ${C_BLD}$BOARD${C_RST} (top: $TOP)"
+    printf '   %sfontes:%s %s\n' "$C_DIM" "$C_RST" "$(for s in "${SRCS[@]}"; do printf '%s ' "${s#"$DIR"/}"; done)"
+    printf '   %spinos:%s  %s\n' "$C_DIM" "$C_RST" "${CST#"$DIR"/}"
+
+    case "$FAMILY" in
+        gowin)
+            step yosys   yosys -p "synth_gowin -top $TOP -json synth.json" "${SRCS[@]}"
+            # shellcheck disable=SC2086
+            step nextpnr nextpnr-himbaechel --device "$DEVICE" --json synth.json --write pnr.json \
+                         --vopt family="$GOWIN_FAMILY" --vopt cst="$CST" $NEXTPNR_ARGS
+            step pack    gowin_pack -d "$GOWIN_FAMILY" -o "$BITFILE" pnr.json
+            ;;
+        ice40)
+            step yosys   yosys -p "synth_ice40 -top $TOP -json synth.json" "${SRCS[@]}"
+            # shellcheck disable=SC2086
+            step nextpnr nextpnr-ice40 "--$DEVICE" --package "$PACKAGE" --json synth.json \
+                         --pcf "$CST" --asc pnr.asc $NEXTPNR_ARGS
+            step pack    icepack pnr.asc "$BITFILE"
+            ;;
+        ecp5)
+            step yosys   yosys -p "synth_ecp5 -top $TOP -json synth.json" "${SRCS[@]}"
+            # shellcheck disable=SC2086
+            step nextpnr nextpnr-ecp5 "--$DEVICE" --package "$PACKAGE" --json synth.json \
+                         --lpf "$CST" --textcfg pnr.config $NEXTPNR_ARGS
+            # shellcheck disable=SC2086
+            step pack    ecppack --compress $ECPPACK_ARGS pnr.config "$BITFILE"
+            ;;
+    esac
+
+    echo "$hash" > "$BUILD/.hash"
+    local fmax
+    fmax="$(grep -oE "Max frequency for clock[^:]*: [0-9.]+ MHz" "$BUILD/nextpnr.log" | tail -n 1 || true)"
+    [[ -n "$fmax" ]] && printf '   %s%s%s\n' "$C_DIM" "$fmax" "$C_RST"
+    ok "Bitstream: ${BITFILE#"$DIR"/}"
+}
+
+cmd_load() {
+    [[ -n "${BITFILE:-}" ]] || { resolve_project; load_board; }
+    need openFPGALoader
+    [[ -f "$BITFILE" ]] || die "Bitstream não encontrado: $BITFILE — rode 'forja synth' ou 'forja run'"
+
+    local args=(-b "$LOADER_BOARD")
+    local where="SRAM (volátil)"
+    if ((PERSIST)); then args+=(--write-flash); where="flash (permanente)"; fi
+
+    info "Gravando ${BITFILE#"$DIR"/} na $where da $BOARD"
+    if openFPGALoader "${args[@]}" "$BITFILE"; then
+        ok "Gravado"
+    else
+        echo
+        warn "Dicas: a placa está conectada? 'forja detect' a encontra?"
+        warn "       Sem permissão USB? Veja as regras udev do openFPGALoader."
+        die "Falha ao gravar"
+    fi
+}
+
+cmd_run() {
+    cmd_synth
+    cmd_load
+}
+
+cmd_sim() {
+    resolve_project
+    find_sources
+    need iverilog vvp
+
+    local tb="" c cands=()
+    for c in "$DIR/sim/${TOP}_tb.v" "$DIR/sim/${TOP}_tb.sv" "$DIR/${TOP}_tb.v" "$DIR/${TOP}_tb.sv"; do
+        [[ -f "$c" ]] && { tb="$c"; break; }
+    done
+    if [[ -z "$tb" ]]; then
+        for c in "$DIR"/sim/*_tb.v "$DIR"/sim/*_tb.sv "$DIR"/*_tb.v "$DIR"/*_tb.sv; do
+            [[ -f "$c" ]] && cands+=("$c")
+        done
+        case ${#cands[@]} in
+            1) tb="${cands[0]}" ;;
+            0) die "Nenhum testbench encontrado (esperado: sim/${TOP}_tb.v)" ;;
+            *) die "Vários testbenches encontrados; use -t para escolher (procura <top>_tb.v)" ;;
+        esac
+    fi
+
+    local simdir="$DIR/build/sim"
+    mkdir -p "$simdir"
+    info "Compilando simulação (${tb#"$DIR"/})"
+    iverilog -g2012 -o "$simdir/sim.out" "${SRCS[@]}" "$tb" || die "Falha no iverilog"
+
+    info "Executando (diretório de trabalho: $(basename "$DIR")/)"
+    (cd "$DIR" && vvp -n "$simdir/sim.out") || die "Falha no vvp"
+
+    local vcd
+    vcd="$(find "$DIR" -name '*.vcd' -newer "$simdir/sim.out" -printf '%T@ %p\n' 2>/dev/null \
+           | sort -rn | head -n 1 | cut -d' ' -f2-)"
+    if [[ -z "$vcd" ]]; then
+        warn "Nenhum .vcd gerado. O testbench tem \$dumpfile/\$dumpvars? (caminho relativo à pasta do projeto)"
+    elif ((NO_WAVE)); then
+        ok "Ondas: ${vcd#"$DIR"/}"
+    else
+        need gtkwave
+        ok "Abrindo ${vcd#"$DIR"/} no GTKWave"
+        nohup gtkwave "$vcd" >/dev/null 2>&1 &
+    fi
+}
+
+cmd_clean() {
+    resolve_project
+    if [[ -d "$DIR/build" ]]; then
+        rm -rf -- "$DIR/build"
+        ok "Removido ${DIR}/build"
+    else
+        ok "Nada para limpar"
+    fi
+}
+
+cmd_detect() {
+    need openFPGALoader
+    if [[ -n "$CLI_BOARD" ]] || [[ -f "$DIR/forja.conf" ]] || [[ -f "$USER_CONF_DIR/config" ]]; then
+        resolve_project
+        if [[ -n "$BOARD" ]]; then
+            load_board
+            openFPGALoader -b "$LOADER_BOARD" --detect
+            return
+        fi
+    fi
+    openFPGALoader --detect
+}
+
+cmd_boards() {
+    local default="" d f name seen=" "
+    read_conf "$USER_CONF_DIR/config"; default="$BOARD"
+    printf '%s%-16s %-8s %s%s\n' "$C_BLD" "PLACA" "FAMÍLIA" "DESCRIÇÃO" "$C_RST"
+    for d in "$USER_CONF_DIR/boards" "$FORJA_HOME/boards"; do
+        [[ -d "$d" ]] || continue
+        for f in "$d"/*.sh; do
+            [[ -f "$f" ]] || continue
+            name="$(basename "$f" .sh)"
+            [[ "$seen" == *" $name "* ]] && continue
+            seen+="$name "
+            # shellcheck disable=SC2016
+            (FAMILY=; DESCRIPTION=; source "$f"
+             mark=""; [[ "$name" == "$default" ]] && mark=" ${C_GRN}(padrão)${C_RST}"
+             printf '%-16s %-8s %s%s\n' "$name" "$FAMILY" "$DESCRIPTION" "$mark")
+        done
+    done
+}
+
+cmd_init() {
+    [[ -d "$DIR" ]] || die "Pasta não encontrada: $DIR"
+    DIR="$(cd "$DIR" && pwd)"
+    local conf="$DIR/forja.conf"
+    [[ -e "$conf" ]] && die "Já existe: $conf"
+    [[ -n "$CLI_BOARD" ]] || die "Informe a placa: forja init -b <placa> (veja 'forja boards')"
+    BOARD="$CLI_BOARD"; TOP="${CLI_TOP:-top}"
+    load_board
+    {
+        echo "# Configuração do forja para este projeto"
+        echo "BOARD=$BOARD"
+        echo "TOP=$TOP"
+        echo "# CONSTRAINTS=constraints.$CST_EXT"
+    } > "$conf"
+    ok "Criado $conf"
+}
+
+cmd_doctor() {
+    local fam t all_ok=1
+    check() {
+        if command -v "$1" >/dev/null 2>&1; then
+            printf '   %s✓%s %s\n' "$C_GRN" "$C_RST" "$1"
+        else
+            printf '   %s✗%s %s\n' "$C_RED" "$C_RST" "$1"; all_ok=0
+        fi
+    }
+    echo "${C_BLD}Comum${C_RST}"
+    for t in yosys openFPGALoader; do check "$t"; done
+    echo "${C_BLD}Simulação${C_RST}"
+    for t in iverilog vvp gtkwave; do check "$t"; done
+    for fam in gowin ice40 ecp5; do
+        echo "${C_BLD}Família $fam${C_RST}"
+        for t in $(family_tools "$fam"); do [[ "$t" == yosys ]] || check "$t"; done
+    done
+    echo
+    if ((all_ok)); then ok "Tudo instalado"; else
+        warn "Faltam ferramentas. No Arch: pacman -S yosys openfpgaloader iverilog gtkwave;"
+        warn "yay -S nextpnr-git prjapicula (gowin), icestorm (ice40), prjtrellis (ecp5)."
+    fi
+}
+
+case "$CMD" in
+    synth)            cmd_synth ;;
+    load)             cmd_load ;;
+    run)              cmd_run ;;
+    sim)              cmd_sim ;;
+    clean)            cmd_clean ;;
+    detect)           cmd_detect ;;
+    boards)           cmd_boards ;;
+    init)             cmd_init ;;
+    doctor)           cmd_doctor ;;
+    help|-h|--help)   usage ;;
+    version|--version) echo "forja $FORJA_VERSION" ;;
+    *)                die "Comando desconhecido: $CMD (veja 'forja --help')" ;;
+esac

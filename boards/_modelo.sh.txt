@@ -1,0 +1,20 @@
+# Modelo de perfil de placa. Copie para boards/<nome>.sh
+# (ou ~/.config/forja/boards/<nome>.sh) e preencha.
+#
+# DESCRIPTION   texto exibido em 'forja boards'
+# FAMILY        gowin | ice40 | ecp5
+# DEVICE        gowin: parte completa (ex.: GW2AR-LV18QN88C8/I7)
+#               ice40: hx1k, hx8k, up5k, ...   (vira --<DEVICE> no nextpnr)
+#               ecp5:  25k, 45k, 85k, um5g-25k (vira --<DEVICE> no nextpnr)
+# GOWIN_FAMILY  só gowin (ex.: GW2A-18C, GW1N-9C)
+# PACKAGE       só ice40/ecp5 (ex.: sg48, CABGA381)
+# LOADER_BOARD  nome da placa no openFPGALoader (openFPGALoader --list-boards)
+# NEXTPNR_ARGS  (opcional) argumentos extras para o nextpnr
+# ECPPACK_ARGS  (opcional, ecp5) ex.: "--idcode 0x21111043"
+
+DESCRIPTION=""
+FAMILY=
+DEVICE=""
+GOWIN_FAMILY=""
+PACKAGE=""
+LOADER_BOARD=

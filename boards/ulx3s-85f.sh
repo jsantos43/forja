@@ -1,0 +1,6 @@
+# Radiona ULX3S 85F — Lattice ECP5 LFE5U-85F
+DESCRIPTION="ULX3S 85F (ECP5 LFE5U-85F)"
+FAMILY=ecp5
+DEVICE=85k           # vira --85k no nextpnr-ecp5
+PACKAGE=CABGA381
+LOADER_BOARD=ulx3s

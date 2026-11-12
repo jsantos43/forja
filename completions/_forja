@@ -1,0 +1,38 @@
+#compdef forja
+
+_forja_boards() {
+    local -a boards
+    local d f
+    for d in "${XDG_CONFIG_HOME:-$HOME/.config}/forja/boards" "${${commands[forja]:A}:h}/boards"; do
+        for f in $d/*.sh(N); do boards+=(${f:t:r}); done
+    done
+    _describe 'placa' boards
+}
+
+_forja() {
+    local -a cmds
+    cmds=(
+        'synth:sintetiza e gera o bitstream'
+        'load:grava o bitstream existente'
+        'run:sintetiza e grava'
+        'sim:simula com iverilog + GTKWave'
+        'clean:apaga build/'
+        'detect:detecta a placa conectada'
+        'boards:lista as placas'
+        'init:cria forja.conf'
+        'doctor:verifica as ferramentas'
+    )
+    _arguments -s \
+        '1:comando:->cmd' \
+        '(-b --board)'{-b,--board}'[placa alvo]:placa:_forja_boards' \
+        '(-t --top)'{-t,--top}'[módulo top]:módulo:' \
+        '(-p --persistent)'{-p,--persistent}'[grava na flash]' \
+        '(-f --force)'{-f,--force}'[força ressíntese]' \
+        '(-v --verbose)'{-v,--verbose}'[saída completa]' \
+        '(-n --no-wave)'{-n,--no-wave}'[não abre o GTKWave]' \
+        '(-h --help)'{-h,--help}'[ajuda]' \
+        '*:pasta:_files -/'
+    [[ $state == cmd ]] && _describe 'comando' cmds
+}
+
+_forja "$@"
